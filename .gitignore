@@ -1,0 +1,6 @@
+.env
+forge_wallet_*.json
+__pycache__/
+*.pyc
+.venv/
+venv/
