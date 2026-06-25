@@ -1,4 +1,5 @@
 .env
+wallets.json
 forge_wallet_*.json
 __pycache__/
 *.pyc

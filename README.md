@@ -1,48 +1,65 @@
 # Forge Testnet Bot
 
-Full automation bot for [Forge Lending](https://testnet.forge.endure.network) on Bittensor EVM Testnet.
+24/7 automation bot for [Forge Lending](https://testnet.forge.endure.network) on Bittensor EVM Testnet.
 
 ## Features
 
-- ✅ **Wallet generation** — EVM + Substrate (SS58) wallet pair
-- ✅ **Captcha solving** — reCAPTCHA v2 via 2captcha API
-- ✅ **Faucet claim** — TAO from taoswap.org testnet faucet
-- ✅ **EVM faucet** — Drip from Forge elementary-capped faucet
+- ✅ **Multi-account** — manages multiple wallets automatically
+- ✅ **Wallet generation** — EVM + Substrate (SS58) pair each
+- ✅ **Captcha solving** — reCAPTCHA v2 via 2captcha
+- ✅ **Faucet claim** — TAO from taoswap.org
+- ✅ **EVM faucet** — Drip from Forge faucet contract
 - ✅ **Wrap TAO → wsTAO** — Mint wrapped TAO
 - ✅ **Supply wsTAO** — Approve → Enter Market → Mint vWsTAO
 - ✅ **Borrow** — Borrow against supplied collateral
+- ✅ **24/7 loop** — Runs forever, generates new wallets, tracks cooldowns
 
-## Prerequisites
+## Quick Start
 
 ```bash
-# Python 3.10+
+# 1. Install
+git clone https://github.com/0xKii/forge-testnet-bot.git
+cd forge-testnet-bot
 pip install -r requirements.txt
+
+# 2. Configure
+cp .env.example .env
+# Edit .env — add your 2captcha key
+
+# 3. Run
+python forge_bot.py
 ```
 
-## Usage
+## Configuration (`.env`)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `2CAPTCHA_API_KEY` | — | **Required.** Your 2captcha API key |
+| `LOOP_INTERVAL` | `3600` | Seconds between iterations (1h) |
+| `FAUCET_COOLDOWN` | `86400` | Cooldown per wallet between faucet claims (24h) |
+| `WALLET_COUNT` | `3` | Wallets to generate at first run |
+
+## Commands
 
 ```bash
-# Full auto (generate wallet + faucet + all steps)
-python forge_bot.py --2captcha YOUR_2CAPTCHA_KEY
+# Normal 24/7 loop mode (auto-generates wallets)
+python forge_bot.py
 
-# Use existing wallet
-python forge_bot.py --key EVM_PRIVATE_KEY --2captcha YOUR_2CAPTCHA_KEY
-
-# EVM steps only (if already funded)
-python forge_bot.py --key EVM_PRIVATE_KEY --auto
+# Single run for specific wallet
+python forge_bot.py --once --wallet 0
 ```
 
-### Without 2captcha
+## How it works
 
-If you don't have a 2captcha API key:
-
-1. Get TAO from [taoswap.org testnet faucet](https://taoswap.org/testnet-faucet)
-2. Bridge to EVM via Forge UI
-3. Run EVM steps:
-
-```bash
-python forge_bot.py --key YOUR_EVM_PK --auto
-```
+1. Loads wallets from `wallets.json` (or generates fresh ones)
+2. For each wallet:
+   - If balance < 0.01 TAO → claim faucet (2captcha + taoswap API)
+   - Claim EVM faucet (drip)
+   - Wrap 80% TAO → wsTAO
+   - Supply 80% wsTAO to Forge
+   - Borrow 2% of supplied amount
+3. Every 12 iterations, generates 2 new wallets
+4. Sleeps LOOP_INTERVAL seconds, then repeats
 
 ## Network
 
@@ -61,6 +78,12 @@ python forge_bot.py --key YOUR_EVM_PK --auto
 | wsTAO | `0xcff46eb93307ca7E24A7cE2A1Eb0F485A27D461a` |
 | vWsTAO | `0x782E5a6Dc16901ec13D4D1e450A8270F4e6E75cf` |
 | Faucet | `0x35c23b26B3A6bF06a5ECdD7420e800dB7c7866Fe` |
+
+## Manual Bridge
+
+After faucet claim, native TAO needs to be bridged to EVM:
+- Go to [Forge Bridge](https://testnet.forge.endure.network/#/bridge)
+- Or use `btcli wallet transfer` on testnet
 
 ## Disclaimer
 
