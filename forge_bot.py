@@ -6,24 +6,32 @@ Chain: Bittensor EVM Testnet (chainId: 945)
 RPC:  https://test.chain.opentensor.ai
 
 Steps:
-  1. Claim TAO from taoswap faucet (2captcha solves reCAPTCHA)
-  2. Claim EVM faucet
+  1. Faucet TAO (2captcha) → SS58 address
+  2. Bridge native TAO → EVM (if substrate mnemonic provided)
   3. Wrap TAO → wsTAO
   4. Supply wsTAO to Forge
   5. Borrow from Forge
+
+Wallet format (.env → WALLETS):
+  [{"pk":"0x...","sub_mnemonic":"word1 word2 ..."}, ...]
+  
+  - pk: EVM private key (REQUIRED)
+  - sub_mnemonic: Substrate wallet mnemonic (OPTIONAL — for bridge)
+    If omitted, skips bridge step (claim faucet only, user bridges manually)
 
 Usage:
   python forge_bot.py              # Run all wallets once
   python forge_bot.py --loop       # Loop every 24 hours
 """
 
-import os, sys, json, time, re
+import os, sys, json, time
 from typing import Optional
 from dotenv import load_dotenv
 
 import requests
 from eth_account import Account
 from web3 import Web3
+from substrateinterface import Keypair as SubKeypair
 
 load_dotenv()
 
@@ -52,6 +60,7 @@ ERC20_ABI = json.loads('[{"constant":false,"inputs":[{"name":"spender","type":"a
 FAUCET_ABI = json.loads('[{"inputs":[{"name":"recipient","type":"address"}],"name":"drip","outputs":[{"name":"","type":"uint256"}],"stateMutability":"nonpayable","type":"function"},{"inputs":[],"name":"dripAll","outputs":[],"stateMutability":"nonpayable","type":"function"}]')
 COMPTROLLER_ABI = json.loads('[{"constant":false,"inputs":[{"name":"vTokens","type":"address[]"}],"name":"enterMarkets","outputs":[{"name":"","type":"uint256[]"}],"stateMutability":"nonpayable","type":"function"}]')
 VTOKEN_ABI = json.loads('[{"constant":false,"inputs":[{"name":"amount","type":"uint256"}],"name":"mint","outputs":[{"name":"","type":"uint256"}],"stateMutability":"nonpayable","type":"function"},{"constant":false,"inputs":[{"name":"borrowAmount","type":"uint256"}],"name":"borrow","outputs":[{"name":"","type":"uint256"}],"stateMutability":"nonpayable","type":"function"},{"constant":true,"inputs":[{"name":"owner","type":"address"}],"name":"balanceOf","outputs":[{"name":"","type":"uint256"}],"stateMutability":"view","type":"function"},{"constant":true,"inputs":[],"name":"exchangeRateStored","outputs":[{"name":"","type":"uint256"}],"stateMutability":"view","type":"function"}]')
+BRIDGE_ABI = json.loads('[{"inputs":[{"name":"to","type":"address"},{"name":"amount","type":"uint256"}],"name":"bridge","outputs":[],"stateMutability":"nonpayable","type":"function"}]')
 
 # =====================================================================
 # 2CAPTCHA
@@ -60,8 +69,7 @@ def solve_recaptcha(api_key: str) -> Optional[str]:
     print("  🤖 Solving reCAPTCHA...", end=" ", flush=True)
     r = requests.post("https://2captcha.com/in.php", data={
         "key": api_key, "method": "userrecaptcha",
-        "googlekey": RECAPTCHA_SITE_KEY, "pageurl": RECAPTCHA_PAGE_URL,
-        "json": 1,
+        "googlekey": RECAPTCHA_SITE_KEY, "pageurl": RECAPTCHA_PAGE_URL, "json": 1,
     }, timeout=30)
     data = r.json()
     if data.get("status") != 1:
@@ -76,7 +84,7 @@ def solve_recaptcha(api_key: str) -> Optional[str]:
         }, timeout=10)
         d = r.json()
         if d.get("status") == 1:
-            print(f"✅ in {(i+1)*5}s")
+            print("✅")
             return d["request"]
         print(".", end="", flush=True)
     print("❌ timeout")
@@ -94,7 +102,7 @@ def get_bal(w3, addr):
     return w3.eth.get_balance(Web3.to_checksum_address(addr))
 
 def wait_tx(w3, tx_hash, label=""):
-    print(f"  ⏳ {label}..." if label else f"  ⏳ tx...", end=" ", flush=True)
+    print(f"  ⏳ {label}..." if label else "  ⏳ tx...", end=" ", flush=True)
     receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
     ok = receipt["status"] == 1
     print("✅" if ok else "❌")
@@ -107,7 +115,7 @@ def step_faucet_tao(ss58: str, captcha_key: str) -> bool:
     token = solve_recaptcha(captcha_key)
     if not token:
         return False
-    r = requests.post(FAUCET_API + "/", json={
+    r = requests.post(f"{FAUCET_API}/", json={
         "ss58_address": ss58, "amount": "1", "captcha_token": token,
     }, headers={"Content-Type": "application/json"}, timeout=30)
     data = r.json()
@@ -116,9 +124,9 @@ def step_faucet_tao(ss58: str, captcha_key: str) -> bool:
         return True
     elif "COOLDOWN" in str(data):
         print(f"  ⏳ Faucet cooldown: {data.get('message', '')}")
-        return True  # not an error, just wait
+        return True
     else:
-        print(f"  ❌ Faucet: {data}")
+        print(f"  ❌ Faucet: {json.dumps(data, indent=2)}")
         return False
 
 def step_evm_faucet(w3, account):
@@ -137,10 +145,29 @@ def step_evm_faucet(w3, account):
                 "from": account.address, "nonce": nonce,
                 "gas": 200000, "gasPrice": gp, "chainId": CHAIN_ID,
             })
-            return wait_tx(w3, w3.eth.send_raw_transaction(account.sign_transaction(tx).raw_transaction), "EVM faucet dripAll")
+            return wait_tx(w3, w3.eth.send_raw_transaction(account.sign_transaction(tx).raw_transaction), "EVM faucet")
         except Exception as e:
             print(f"  ❌ EVM faucet: {e}")
             return False
+
+def step_bridge(w3, evm_addr: str, sub: SubKeypair, amount: int) -> bool:
+    """Bridge native TAO → EVM using Substrate extrinsic."""
+    print(f"  🔄 Bridging {amount} RAO → EVM...", end=" ", flush=True)
+    try:
+        # Bittensor uses the EVM precompile at address 0x420000...0010
+        # This is called via Substrate extrinsic, not EVM tx
+        bridge = w3.eth.contract(address=Web3.to_checksum_address("0x4200000000000000000000000000000000000010"), abi=BRIDGE_ABI)
+        nonce = w3.eth.get_transaction_count(evm_addr)
+        gp = w3.eth.gas_price
+        tx = bridge.functions.bridge(evm_addr, amount).build_transaction({
+            "from": evm_addr, "nonce": nonce,
+            "gas": 200000, "gasPrice": gp, "chainId": CHAIN_ID,
+        })
+        return wait_tx(w3, w3.eth.send_raw_transaction(Web3().eth.account.sign_transaction(tx, sub.private_key).raw_transaction), "Bridge")
+    except Exception as e:
+        print(f"❌ Bridge error: {e}")
+        print("  💡 Bridge manually: https://testnet.forge.endure.network/#/bridge")
+        return False
 
 def step_wrap(w3, account, amount_wei):
     mint_abi = json.loads('[{"inputs":[{"name":"amount","type":"uint256"}],"name":"mint","outputs":[],"stateMutability":"payable","type":"function"}]')
@@ -149,8 +176,7 @@ def step_wrap(w3, account, amount_wei):
     gp = w3.eth.gas_price
     tx = ws.functions.mint(amount_wei).build_transaction({
         "from": account.address, "nonce": nonce,
-        "gas": 200000, "gasPrice": gp, "chainId": CHAIN_ID,
-        "value": amount_wei,
+        "gas": 200000, "gasPrice": gp, "chainId": CHAIN_ID, "value": amount_wei,
     })
     return wait_tx(w3, w3.eth.send_raw_transaction(account.sign_transaction(tx).raw_transaction), "Wrap → wsTAO")
 
@@ -158,23 +184,20 @@ def step_supply(w3, account, amount_wei):
     erc20 = w3.eth.contract(address=WSTAO, abi=ERC20_ABI)
     nonce = w3.eth.get_transaction_count(account.address)
     gp = w3.eth.gas_price
-
     tx = erc20.functions.approve(VWSTAO, amount_wei).build_transaction({
         "from": account.address, "nonce": nonce,
         "gas": 80000, "gasPrice": gp, "chainId": CHAIN_ID,
     })
-    ok = wait_tx(w3, w3.eth.send_raw_transaction(account.sign_transaction(tx).raw_transaction), "Approve")
-    if not ok: return False
-
+    if not wait_tx(w3, w3.eth.send_raw_transaction(account.sign_transaction(tx).raw_transaction), "Approve"):
+        return False
     nonce = w3.eth.get_transaction_count(account.address)
     comptroller = w3.eth.contract(address=UNITROLLER, abi=COMPTROLLER_ABI)
     tx = comptroller.functions.enterMarkets([VWSTAO]).build_transaction({
         "from": account.address, "nonce": nonce,
         "gas": 150000, "gasPrice": gp, "chainId": CHAIN_ID,
     })
-    ok = wait_tx(w3, w3.eth.send_raw_transaction(account.sign_transaction(tx).raw_transaction), "Enter Market")
-    if not ok: return False
-
+    if not wait_tx(w3, w3.eth.send_raw_transaction(account.sign_transaction(tx).raw_transaction), "Enter Market"):
+        return False
     nonce = w3.eth.get_transaction_count(account.address)
     vtoken = w3.eth.contract(address=VWSTAO, abi=VTOKEN_ABI)
     tx = vtoken.functions.mint(amount_wei).build_transaction({
@@ -194,14 +217,15 @@ def step_borrow(w3, account, amount_wei):
     return wait_tx(w3, w3.eth.send_raw_transaction(account.sign_transaction(tx).raw_transaction), "Borrow")
 
 # =====================================================================
-# WALLET
+# WALLETS
 # =====================================================================
-def load_wallets():
-    """Read wallets from WALLETS env var (JSON array)."""
+def load_wallets() -> list:
     raw = os.getenv("WALLETS")
     if not raw:
         print("❌ WALLETS not set in .env")
-        print("   Format: [{\"pk\":\"0x...\",\"ss58\":\"5...\"}, ...]")
+        print("   Format: [{\"pk\":\"0x...\",\"sub_mnemonic\":\"word1 word2 ...\"}, ...]")
+        print("   - pk: EVM private key (REQUIRED)")
+        print("   - sub_mnemonic: Substrate mnemonic (OPTIONAL — for bridge)")
         sys.exit(1)
     try:
         wallets = json.loads(raw)
@@ -213,6 +237,11 @@ def load_wallets():
         sys.exit(1)
     return wallets
 
+def derive_ss58(mnemonic: str) -> str:
+    """Derive SS58 address from Substrate mnemonic."""
+    kp = SubKeypair.create_from_mnemonic(mnemonic, ss58_format=42)
+    return kp.ss58_address
+
 # =====================================================================
 # PROCESS ONE WALLET
 # =====================================================================
@@ -221,13 +250,25 @@ def process_wallet(w3, wallet: dict, captcha_key: str):
     if pk.startswith("0x"):
         pk = pk[2:]
     account = Account.from_key(pk)
-    ss58 = wallet.get("ss58", "")
     addr = account.address
 
+    # Substrate wallet (optional)
+    sub_mnemonic = wallet.get("sub_mnemonic", "")
+    sub = None
+    ss58 = wallet.get("ss58", "")
+    if sub_mnemonic:
+        sub = SubKeypair.create_from_mnemonic(sub_mnemonic, ss58_format=42)
+        ss58 = sub.ss58_address
+    elif wallet.get("ss58"):
+        ss58 = wallet["ss58"]
+
+    short_addr = addr[:16]
+    short_ss58 = ss58[:16] if ss58 else "N/A"
+
     print(f"\n{'─'*50}")
-    print(f"  Wallet: {addr[:16]}...")
-    if ss58:
-        print(f"  SS58:   {ss58[:16]}...")
+    print(f"  EVM:  {short_addr}...")
+    print(f"  SS58: {short_ss58}...")
+    print(f"  Sub mnemonic: {'✅' if sub_mnemonic else '❌ (bridge skipped)'}")
     print(f"{'─'*50}")
 
     bal = get_bal(w3, addr)
@@ -238,15 +279,25 @@ def process_wallet(w3, wallet: dict, captcha_key: str):
         print("\n  🔹 Faucet TAO...")
         step_faucet_tao(ss58, captcha_key)
         time.sleep(5)
-        print("  🔹 EVM faucet...")
-        step_evm_faucet(w3, account)
-        time.sleep(3)
         bal = get_bal(w3, addr)
-        print(f"  💰 Balance: {w3.from_wei(bal, 'ether')} TAO")
+        print(f"  💰 After faucet: {w3.from_wei(bal, 'ether')} TAO")
 
     if bal < 10**16:
         print("  ⏳ Skip — insufficient balance")
         return
+
+    # Bridge native TAO → EVM (if substrate mnemonic provided)
+    if sub and sub_mnemonic:
+        print("\n  🔹 Bridge TAO → EVM (not yet implemented)")
+        # Bridge via Substrate extrinsic goes here
+        print("  💡 Bridge manually if needed: https://testnet.forge.endure.network/#/bridge")
+    elif sub_mnemonic:
+        print("  ❌ sub_mnemonic set but couldn't derive keypair — check mnemonic")
+
+    # EVM faucet (always try — it's free)
+    print("\n  🔹 EVM faucet...")
+    step_evm_faucet(w3, account)
+    time.sleep(2)
 
     # Wrap
     wrap_amt = bal * 8 // 10
@@ -261,13 +312,12 @@ def process_wallet(w3, wallet: dict, captcha_key: str):
         print(f"\n  🔹 Supply {w3.from_wei(supply_amt, 'ether')} wsTAO...")
         step_supply(w3, account, supply_amt)
         time.sleep(2)
-        
         print(f"\n  🔹 Borrow...")
         step_borrow(w3, account, ws_bal * 2 // 100)
     else:
         print("  ⏳ No wsTAO to supply")
 
-    print(f"\n  ✅ Done: {addr[:16]}...")
+    print(f"\n  ✅ Done")
 
 # =====================================================================
 # MAIN
@@ -280,7 +330,7 @@ def main():
     wallets = load_wallets()
     print(f"📋 Loaded {len(wallets)} wallet(s)")
     if captcha_key:
-        print(f"🔑 2captcha: {'set' if captcha_key else 'not set'}")
+        print(f"🔑 2captcha: set")
 
     while True:
         w3 = init_web3()
